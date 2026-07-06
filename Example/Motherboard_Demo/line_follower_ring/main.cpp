@@ -1,6 +1,7 @@
 #include "pid.hpp"
 #include "schedule.hpp"
 #include "zf_driver_encoder.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -11,6 +12,9 @@
 #include <pthread.h>
 #include <thread>
 #include <unistd.h>
+extern "C" {
+#include "image.h"
+}
 #define KEY_0 "/dev/zf_driver_gpio_key_0"
 #define KEY_1 "/dev/zf_driver_gpio_key_1"
 
@@ -21,7 +25,6 @@
 #define ENCODER_1 "/dev/zf_encoder_1"
 #define ENCODER_2 "/dev/zf_encoder_2"
 
-#include "find_line_lib/calculate_wheel_speeds.h"
 #include "pwm.hpp"
 
 // ==========================================
@@ -34,12 +37,13 @@ const int FRAME_HEIGHT = 120;
 // ==========================================
 // PID参数和全局变量
 // ==========================================
-float g_left_kp = 5.71f, g_left_ki = 4.01f, g_left_kd = 0.0f;
-float g_right_kp = 7.48f, g_right_ki = 4.23f, g_right_kd = 0.0f;
+float g_left_kp =2.74f, g_left_ki = 0.45f, g_left_kd = 0.0f;
+float g_right_kp = 2.77f, g_right_ki = 0.62f, g_right_kd = 0.0f;
 
 volatile float g_left_target_speed = 0.0f, g_right_target_speed = 0.0f;
 
 volatile sig_atomic_t g_running = 1;
+int Speed_Goal = 85;
 
 // 持久化 fd API：两个 fd 存放在 std::atomic<int> 中，避免依赖 zf 库
 static std::atomic<int> gpio_fd1{-1};
@@ -126,8 +130,57 @@ float right_kp_func(float error) { return error * g_right_kp; }
 
 float convert_to_pwm_output(float value) { return (value + 5000.0) / 100.0; }
 
+static void Data_Settings(void) {
+  ImageStatus.MiddleLine = 43;
+  ImageStatus.TowPoint_Gain = 0.2;
+  ImageStatus.TowPoint_Offset_Max = 5;
+  ImageStatus.TowPoint_Offset_Min = -2;
+  ImageStatus.TowPointAdjust_v = 160;
+  ImageStatus.Det_all_k = 0.7;
+  ImageStatus.CirquePass = 'F';
+  ImageStatus.IsCinqueOutIn = 'F';
+  ImageStatus.CirqueOut = 'F';
+  ImageStatus.CirqueOff = 'F';
+  ImageStatus.Barn_Flag = 0;
+  ImageStatus.straight_acc = 0;
+  ImageStatus.TowPoint = 15;
+  ImageStatus.Threshold_static = 70;
+  ImageStatus.Threshold_detach = 180;
+  ImageScanInterval = 2;
+  ImageScanInterval_Cross = 5;
+  ImageStatus.variance_acc = 25;
+  SystemData.Stop = 0;
+}
+
+static std::pair<float, float> PredictTargetWheelSpeeds(float base_speed) {
+  int tow_row = ImageStatus.TowPoint_True;
+  if (tow_row < ImageStatus.OFFLine || tow_row >= LCDH) {
+    tow_row = ImageStatus.TowPoint;
+  }
+  if (tow_row < ImageStatus.OFFLine) {
+    tow_row = ImageStatus.OFFLine;
+  }
+  if (tow_row >= LCDH) {
+    tow_row = LCDH - 1;
+  }
+
+  float center_error = static_cast<float>(ImageDeal[tow_row].Center) -
+                       static_cast<float>(ImageStatus.MiddleLine);
+  float det_error = static_cast<float>(ImageStatus.Det_True) -
+                    static_cast<float>(ImageStatus.MiddleLine);
+  float error = 0.5f * center_error + 0.5f * det_error;
+
+  constexpr float turn_gain = 0.6f;
+  float left_speed = base_speed + error * turn_gain;
+  float right_speed = base_speed - error * turn_gain;
+
+  left_speed = std::clamp(left_speed, 10.0f, 120.0f);
+  right_speed = std::clamp(right_speed, 10.0f, 120.0f);
+  return {left_speed, right_speed};
+}
+
 static constexpr TaskConfig myConfigs[] = {
-    {5,
+    {1,
      []() {
        static PID left_pid(100, left_kp_func, g_left_ki, g_left_kd, -5000,
                            5000);
@@ -177,10 +230,7 @@ static constexpr TaskConfig myConfigs[] = {
          right_pid.set_integral_limit(4000, -4000);
          std::cout << "PID 积分限幅设置成功！" << std::endl;
 
-         // 前向/反向死区补偿
-         std::cout << "设置 PID 死区补偿..." << std::endl;
-         left_pid.set_deadzone(439, -553.5);
-         right_pid.set_deadzone(415, -600);
+      
          std::cout << "[PID] 初始化完成！" << std::endl;
 
          initialized = true;
@@ -231,8 +281,8 @@ static constexpr TaskConfig myConfigs[] = {
        }
        
      }},
-    {5, []() {
-       static cv::VideoCapture cap(0);
+    {1, []() {
+       static cv::VideoCapture cap(0, cv::CAP_V4L2);
        static cv::Mat frame;
        static bool initialized = false;
        if (!initialized) {
@@ -246,17 +296,34 @@ static constexpr TaskConfig myConfigs[] = {
 
          initialized = true;
        }
-       cap >> frame;
-       if (frame.empty())
+       if (!cap.read(frame) || frame.empty()) {
          return;
-       auto [left_speed, right_speed] =
-           find_line_lib::calculate_wheel_speeds(frame, 80.0,0.8  );
+       }
+
+       cv::Mat gray;
+       cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+       cv::resize(gray, gray, cv::Size(LCDW, LCDH), 0, 0, cv::INTER_AREA);
+       for (int y = 0; y < LCDH; ++y) {
+         for (int x = 0; x < LCDW; ++x) {
+           Image_Use[y][x] = gray.at<uint8_t>(y, x);
+         }
+       }
+
+       Data_Settings();
+       ImageProcess();
+
+       auto [left_speed, right_speed] = PredictTargetWheelSpeeds(80.0f);
        std::cout << " | Target Speed: L=" << left_speed << " R=" << right_speed
                  << "    \r" << std::flush;
-        if (left_speed < 10.0f) left_speed = 10.0f;   // 保证内侧轮最慢也保持前滚，不反转
-        if (right_speed < 10.0f) right_speed = 10.0f;
-        g_left_target_speed = left_speed;
-        g_right_target_speed = right_speed;
+       if (left_speed < 10.0f) {
+         left_speed = 10.0f;
+       }
+       if (right_speed < 10.0f) {
+         right_speed = 10.0f;
+       }
+       // 当前硬件/安装方向下，左右轮的目标速度需要互换映射。
+       g_left_target_speed = right_speed;
+       g_right_target_speed = left_speed;
      }}};
 static auto get_time() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(

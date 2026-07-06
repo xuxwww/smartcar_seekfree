@@ -7,11 +7,17 @@ add_compile_options(-Ofast -flto)
 add_link_options(-flto)
 
 # ---- line_follower_ring ----
-add_executable(${PROJECT_NAME} main.cpp)
+add_executable(${PROJECT_NAME} main.cpp image.c)
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     SMTC2GO_DEBUG SMTC2GO_DEBUG_IMSHOW SMTC2GO_DEBUG_LOG
 )
-target_link_libraries(${PROJECT_NAME} zf::library find_line_lib template_schedule)
+target_include_directories(${PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(${PROJECT_NAME}
+    PRIVATE
+    zf::library
+    template_schedule
+    ${OpenCV_LIBS}
+)
 install(TARGETS ${PROJECT_NAME} DESTINATION .)
 
 # ---- pid_debug ----

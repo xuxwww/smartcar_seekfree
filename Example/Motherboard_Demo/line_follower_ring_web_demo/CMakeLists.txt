@@ -20,6 +20,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 )
 
 target_link_libraries(${PROJECT_NAME}
+    zf_library
     find_line_lib
     -Wl,-Bstatic -lstdc++ -lgcc -Wl,-Bdynamic
     dl
